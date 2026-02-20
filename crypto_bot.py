@@ -2,8 +2,10 @@ import os
 import asyncio
 import logging
 import json
+import time
 from datetime import datetime
 from typing import Optional
+from aiohttp import web
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,86 +17,242 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "8598007801:AAEclZ2Zzd25t2zR3O1QGwAWfRR5p5t4t1I")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-027fdaa728a64d379f42917c62ff9697")
-WHALE_ALERT_KEY  = os.getenv("WHALE_ALERT_API_KEY", "") 
-COINGECKO_KEY    = os.getenv("COINGECKO_API_KEY", "")    
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
+DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "")
+WHALE_ALERT_KEY   = os.getenv("WHALE_ALERT_API_KEY", "")
+COINGECKO_KEY     = os.getenv("COINGECKO_API_KEY", "")
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-COINGECKO_BASE    = "https://api.coingecko.com/api/v3"
-WHALE_ALERT_BASE  = "https://api.whale-alert.io/v1"
-CRYPTOCOMPARE_BASE= "https://min-api.cryptocompare.com/data"
+# Render 自动注入此变量，格式如 https://your-app.onrender.com
+RENDER_URL        = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+PORT              = int(os.getenv("PORT", 8080))
+
+DEEPSEEK_BASE_URL  = "https://api.deepseek.com"
+COINGECKO_BASE     = "https://api.coingecko.com/api/v3"
+WHALE_ALERT_BASE   = "https://api.whale-alert.io/v1"
+CRYPTOCOMPARE_BASE = "https://min-api.cryptocompare.com/data"
+
+# ── 交易所直连 API（无需注册，真正实时，无严格速率限制）───────────────────────
+BINANCE_BASE = "https://api.binance.com/api/v3"
+OKX_BASE     = "https://www.okx.com/api/v5/market"
+
+# CoinGecko ID → Binance symbol 映射
+COINGECKO_TO_BINANCE: dict[str, str] = {
+    "bitcoin": "BTCUSDT", "ethereum": "ETHUSDT", "solana": "SOLUSDT",
+    "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "cardano": "ADAUSDT",
+    "dogecoin": "DOGEUSDT", "the-open-network": "TONUSDT", "polkadot": "DOTUSDT",
+    "avalanche-2": "AVAXUSDT", "chainlink": "LINKUSDT", "uniswap": "UNIUSDT",
+    "litecoin": "LTCUSDT", "shiba-inu": "SHIBUSDT", "sui": "SUIUSDT",
+    "tron": "TRXUSDT", "pepe": "PEPEUSDT", "aptos": "APTUSDT",
+    "arbitrum": "ARBUSDT", "optimism": "OPUSDT",
+}
+
+# CoinGecko ID → OKX instId 映射（Binance 失败时备用）
+COINGECKO_TO_OKX: dict[str, str] = {
+    "bitcoin": "BTC-USDT", "ethereum": "ETH-USDT", "solana": "SOL-USDT",
+    "binancecoin": "BNB-USDT", "ripple": "XRP-USDT", "cardano": "ADA-USDT",
+    "dogecoin": "DOGE-USDT", "the-open-network": "TON-USDT", "polkadot": "DOT-USDT",
+    "avalanche-2": "AVAX-USDT", "chainlink": "LINK-USDT", "uniswap": "UNI-USDT",
+    "litecoin": "LTC-USDT", "shiba-inu": "SHIB-USDT", "sui": "SUI-USDT",
+    "tron": "TRX-USDT", "pepe": "PEPE-USDT", "aptos": "APT-USDT",
+    "arbitrum": "ARB-USDT", "optimism": "OP-USDT",
+}
+
+# ─── 请求头：强制禁用缓存（关键修复）────────────────────────────────────────
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma":        "no-cache",
+    "Expires":       "0",
+    "User-Agent":    "CryptoSageBot/2.0",
+}
 
 # 对话历史 (per user)
 user_conversations: dict[int, list] = {}
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 
-# ─── API 工具函数 ─────────────────────────────────────────────────────────────
+# ─── 工具：带缓存破坏的 HTTP 请求 ────────────────────────────────────────────
 
-async def fetch_json(url: str, params: dict = None, headers: dict = None) -> Optional[dict]:
-    """通用 HTTP GET JSON 请求"""
+async def fetch_json(
+    url: str,
+    params: dict = None,
+    headers: dict = None,
+    timeout: int = 10
+) -> Optional[dict]:
+    """
+    通用 HTTP GET，强制加时间戳参数防止任何层级缓存。
+    """
+    _params = params.copy() if params else {}
+    # 时间戳参数让每次请求 URL 都不同，彻底破坏 CDN/代理缓存
+    _params["_t"] = int(time.time())
+
+    _headers = {**NO_CACHE_HEADERS, **(headers or {})}
+    if COINGECKO_KEY:
+        _headers["x-cg-demo-api-key"] = COINGECKO_KEY
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(
+                url,
+                params=_params,
+                headers=_headers,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    return await resp.json(content_type=None)
+                elif resp.status == 429:
+                    logger.warning(f"Rate limited: {url}")
+                    return None
+                else:
+                    logger.error(f"HTTP {resp.status}: {url}")
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout: {url}")
     except Exception as e:
         logger.error(f"Fetch error {url}: {e}")
     return None
 
 
-async def get_price(coin_id: str) -> Optional[dict]:
+# ─── 数据获取函数 ─────────────────────────────────────────────────────────────
+
+async def _price_from_binance(coin_id: str) -> Optional[dict]:
     """
-    获取单个或多个代币价格
-    coin_id: bitcoin | ethereum | solana 等 CoinGecko ID
+    从 Binance 获取单个币种实时价格。
+    返回统一格式 {usd, usd_24h_change, usd_24h_vol} 供上层复用。
     """
-    data = await fetch_json(
+    symbol = COINGECKO_TO_BINANCE.get(coin_id)
+    if not symbol:
+        return None
+    # ticker/24hr 包含现价、24h涨跌幅、24h成交量，一次请求全拿
+    data = await fetch_json(f"{BINANCE_BASE}/ticker/24hr", params={"symbol": symbol})
+    if not data:
+        return None
+    price = float(data.get("lastPrice", 0))
+    change_pct = float(data.get("priceChangePercent", 0))
+    vol_usdt = float(data.get("quoteVolume", 0))   # USDT 计价成交量
+    # CNY 汇率用固定近似值（~7.25），避免再多一次 API 请求
+    CNY_RATE = 7.25
+    return {
+        "usd":            price,
+        "cny":            price * CNY_RATE,
+        "usd_24h_change": change_pct,
+        "usd_24h_vol":    vol_usdt,
+        "usd_market_cap": 0,         # Binance 不提供市值，留给 CoinGecko 补充
+        "_source":        "Binance",
+    }
+
+
+async def _price_from_okx(coin_id: str) -> Optional[dict]:
+    """OKX 备用价格源，格式与 Binance 层统一。"""
+    inst_id = COINGECKO_TO_OKX.get(coin_id)
+    if not inst_id:
+        return None
+    data = await fetch_json(f"{OKX_BASE}/ticker", params={"instId": inst_id})
+    if not data or data.get("code") != "0":
+        return None
+    d = data["data"][0]
+    price = float(d.get("last", 0))
+    open24 = float(d.get("open24h", price) or price)
+    change_pct = ((price - open24) / open24 * 100) if open24 else 0
+    vol_usdt = float(d.get("volCcy24h", 0))
+    CNY_RATE = 7.25
+    return {
+        "usd":            price,
+        "cny":            price * CNY_RATE,
+        "usd_24h_change": change_pct,
+        "usd_24h_vol":    vol_usdt,
+        "usd_market_cap": 0,
+        "_source":        "OKX",
+    }
+
+
+async def _price_from_coingecko(coin_ids: str) -> Optional[dict]:
+    """CoinGecko 兜底，提供市值等 Binance 缺失的数据。"""
+    return await fetch_json(
         f"{COINGECKO_BASE}/simple/price",
         params={
-            "ids": coin_id,
+            "ids": coin_ids,
             "vs_currencies": "usd,cny",
             "include_24hr_change": "true",
-            "include_market_cap": "true",
-            "include_24hr_vol": "true",
+            "include_market_cap":  "true",
+            "include_24hr_vol":    "true",
+            "precision":           "full",
         }
     )
-    return data
+
+
+async def get_price(coin_ids: str) -> Optional[dict]:
+    """
+    三层兜底价格查询：Binance → OKX → CoinGecko
+    返回格式与原 CoinGecko 格式兼容，key 为 coin_id。
+    """
+    ids = [c.strip() for c in coin_ids.split(",") if c.strip()]
+    result = {}
+
+    # 并发向 Binance 查所有币种
+    binance_tasks = [_price_from_binance(cid) for cid in ids]
+    binance_results = await asyncio.gather(*binance_tasks, return_exceptions=True)
+
+    need_okx = []
+    need_cg  = []
+
+    for cid, br in zip(ids, binance_results):
+        if isinstance(br, dict) and br.get("usd"):
+            result[cid] = br
+            logger.info(f"Price source: Binance → {cid} = ${br['usd']:,.2f}")
+        else:
+            need_okx.append(cid)
+
+    # OKX 补救
+    if need_okx:
+        okx_tasks = [_price_from_okx(cid) for cid in need_okx]
+        okx_results = await asyncio.gather(*okx_tasks, return_exceptions=True)
+        for cid, okr in zip(need_okx, okx_results):
+            if isinstance(okr, dict) and okr.get("usd"):
+                result[cid] = okr
+                logger.info(f"Price source: OKX → {cid} = ${okr['usd']:,.2f}")
+            else:
+                need_cg.append(cid)
+
+    # CoinGecko 最后兜底
+    if need_cg:
+        cg_data = await _price_from_coingecko(",".join(need_cg))
+        if cg_data:
+            for cid in need_cg:
+                if cid in cg_data:
+                    cg_data[cid]["_source"] = "CoinGecko"
+                    result[cid] = cg_data[cid]
+                    logger.info(f"Price source: CoinGecko → {cid}")
+
+    return result if result else None
 
 
 async def get_market_overview(limit: int = 10) -> Optional[list]:
-    """获取市场 Top N 概览"""
-    data = await fetch_json(
+    return await fetch_json(
         f"{COINGECKO_BASE}/coins/markets",
         params={
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": limit,
-            "page": 1,
-            "sparkline": "false",
+            "vs_currency":             "usd",
+            "order":                   "market_cap_desc",
+            "per_page":                limit,
+            "page":                    1,
+            "sparkline":               "false",
             "price_change_percentage": "1h,24h,7d",
         }
     )
-    return data
 
 
 async def get_trending() -> Optional[dict]:
-    """获取 CoinGecko 热门搜索榜"""
     return await fetch_json(f"{COINGECKO_BASE}/search/trending")
 
 
 async def get_fear_greed() -> Optional[dict]:
-    """获取恐惧贪婪指数"""
     return await fetch_json("https://api.alternative.me/fng/?limit=1")
 
 
 async def get_crypto_news(limit: int = 5) -> Optional[list]:
-    """获取最新加密货币新闻"""
     data = await fetch_json(
         f"{CRYPTOCOMPARE_BASE}/v2/news/",
         params={"lang": "EN", "sortOrder": "latest", "limit": limit}
@@ -103,87 +261,48 @@ async def get_crypto_news(limit: int = 5) -> Optional[list]:
 
 
 async def get_whale_transactions(min_value: int = 1_000_000) -> Optional[dict]:
-    """
-    获取巨鲸大额转账记录
-    需要 Whale Alert API Key (免费注册 whales.io)
-    无 key 时返回模拟数据
-    """
     if not WHALE_ALERT_KEY:
-        # 无 API Key 时使用 CoinGecko 大额交易所流量作为替代
         return {"status": "no_key", "transactions": []}
-
-    data = await fetch_json(
+    return await fetch_json(
         f"{WHALE_ALERT_BASE}/transactions",
-        params={
-            "api_key": WHALE_ALERT_KEY,
-            "min_value": min_value,
-            "limit": 10,
-        }
+        params={"api_key": WHALE_ALERT_KEY, "min_value": min_value, "limit": 10},
     )
-    return data
 
 
-async def get_exchange_flows(coin: str = "bitcoin") -> Optional[dict]:
-    """
-    获取交易所资金流入/流出 (CoinGecko Pro 特性的免费替代)
-    使用全球交易所成交量数据推断
-    """
-    data = await fetch_json(
-        f"{COINGECKO_BASE}/coins/{coin}/market_chart",
-        params={"vs_currency": "usd", "days": "1", "interval": "hourly"}
-    )
-    return data
+async def get_global_stats() -> Optional[dict]:
+    """获取全球加密市场总市值、BTC 占比等"""
+    return await fetch_json(f"{COINGECKO_BASE}/global")
 
 
-# ─── DeepSeek AI 对话 ─────────────────────────────────────────────────────────
+# ─── DeepSeek AI ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """你是一位专业的加密货币市场分析师助手，名为「CryptoSage」。
+SYSTEM_PROMPT = """你是专业加密货币市场分析师「CryptoSage」。
 
-你的能力：
-1. 分析实时市场数据、价格趋势
-2. 解读巨鲸动向和资金流向
-3. 提供技术分析和市场情绪分析
-4. 回答加密货币相关问题
-5. 风险提示和投资建议（附免责声明）
-
-回答风格：
-- 专业但易懂，适当使用表情符号增加可读性
-- 数据分析要有逻辑，结论要有依据
-- 始终在投资建议后附加风险免责声明
-- 回复控制在 500 字内，避免冗长
-
-重要提示：本机器人提供的所有信息仅供参考，不构成投资建议。"""
+能力：分析实时价格趋势、解读巨鲸动向、市场情绪分析、技术面解读。
+风格：专业简洁，适当用 emoji，数据要引用具体数字，结论有依据。
+限制：回复≤500字；投资建议必须附免责声明。
+数据：用户消息中若有[实时市场数据]标记，优先基于该数据分析。"""
 
 
 async def chat_with_deepseek(user_id: int, user_message: str, context_data: str = "") -> str:
-    """
-    调用 DeepSeek API 进行对话，保持上下文
-    """
-    # 初始化对话历史
     if user_id not in user_conversations:
         user_conversations[user_id] = []
 
-    # 拼装带市场数据的用户消息
-    full_message = user_message
-    if context_data:
-        full_message = f"[实时市场数据]\n{context_data}\n\n[用户问题]\n{user_message}"
+    full_message = (
+        f"[实时市场数据 {datetime.utcnow().strftime('%H:%M UTC')}]\n{context_data}\n\n"
+        f"[用户问题]\n{user_message}"
+        if context_data else user_message
+    )
 
-    # 添加到历史
     user_conversations[user_id].append({"role": "user", "content": full_message})
-
-    # 保持最近 10 轮对话（避免超 token）
     if len(user_conversations[user_id]) > 20:
         user_conversations[user_id] = user_conversations[user_id][-20:]
 
     payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *user_conversations[user_id]
-        ],
+        "model":       "deepseek-chat",
+        "messages":    [{"role": "system", "content": SYSTEM_PROMPT}, *user_conversations[user_id]],
         "temperature": 0.7,
-        "max_tokens": 800,
-        "stream": False
+        "max_tokens":  800,
     }
 
     try:
@@ -191,521 +310,469 @@ async def chat_with_deepseek(user_id: int, user_message: str, context_data: str 
             async with session.post(
                 f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
                 json=payload,
-                headers={
-                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                    "Content-Type": "application/json"
-                },
+                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:
                 if resp.status == 200:
                     result = await resp.json()
-                    assistant_msg = result["choices"][0]["message"]["content"]
-                    # 记录 AI 回复到历史
-                    user_conversations[user_id].append({
-                        "role": "assistant",
-                        "content": assistant_msg
-                    })
-                    return assistant_msg
-                else:
-                    error = await resp.text()
-                    logger.error(f"DeepSeek error {resp.status}: {error}")
-                    return "⚠️ AI 服务暂时不可用，请稍后再试。"
+                    msg = result["choices"][0]["message"]["content"]
+                    user_conversations[user_id].append({"role": "assistant", "content": msg})
+                    return msg
+                logger.error(f"DeepSeek {resp.status}: {await resp.text()}")
+                return "⚠️ AI 服务暂时不可用，请稍后再试。"
     except asyncio.TimeoutError:
         return "⏱️ AI 响应超时，请稍后再试。"
     except Exception as e:
-        logger.error(f"DeepSeek exception: {e}")
-        return "❌ 连接 AI 服务失败，请检查网络。"
+        logger.error(f"DeepSeek error: {e}")
+        return "❌ 连接 AI 失败，请检查网络。"
 
 
-# ─── 数据格式化函数 ───────────────────────────────────────────────────────────
+# ─── 格式化函数 ───────────────────────────────────────────────────────────────
 
 def format_price_message(coin_id: str, data: dict) -> str:
-    """格式化价格信息"""
     if coin_id not in data:
-        return f"❌ 未找到 `{coin_id}` 的价格数据"
-    
+        return f"❌ 未找到 `{coin_id}`（请使用 CoinGecko ID）"
     d = data[coin_id]
-    price_usd = d.get("usd", 0)
-    price_cny = d.get("cny", 0)
-    change_24h = d.get("usd_24h_change", 0) or 0
-    vol_24h = d.get("usd_24h_vol", 0) or 0
-    mktcap = d.get("usd_market_cap", 0) or 0
-
+    price_usd  = d.get("usd", 0)
+    price_cny  = d.get("cny", 0)
+    change_24h = d.get("usd_24h_change") or 0
+    vol_24h    = d.get("usd_24h_vol") or 0
+    mktcap     = d.get("usd_market_cap") or 0
+    source     = d.get("_source", "?")
     emoji = "🟢" if change_24h >= 0 else "🔴"
-    arrow = "↑" if change_24h >= 0 else "↓"
-
+    arrow = "▲" if change_24h >= 0 else "▼"
+    mktcap_str = f"`${mktcap:,.0f}`" if mktcap else "`N/A`"
     return (
-        f"💰 *{coin_id.upper()}* 实时价格\n"
+        f"💰 *{coin_id.upper()}*\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"💵 USD: `${price_usd:,.4f}`\n"
-        f"🇨🇳 CNY: `¥{price_cny:,.2f}`\n"
-        f"{emoji} 24h涨跌: `{arrow}{abs(change_24h):.2f}%`\n"
-        f"📊 24h成交量: `${vol_24h:,.0f}`\n"
-        f"🏦 市值: `${mktcap:,.0f}`\n"
-        f"⏰ 更新: {datetime.now().strftime('%H:%M:%S')}"
+        f"💵 `${price_usd:,.6g}`  🇨🇳 `¥{price_cny:,.2f}`\n"
+        f"{emoji} 24h: `{arrow}{abs(change_24h):.2f}%`\n"
+        f"📊 成交量: `${vol_24h:,.0f}`\n"
+        f"🏦 市值: {mktcap_str}\n"
+        f"🔌 数据源: `{source}`\n"
+        f"🕐 `{datetime.utcnow().strftime('%H:%M:%S')} UTC`"
     )
 
 
 def format_market_overview(coins: list) -> str:
-    """格式化市场概览"""
-    lines = ["📊 *市场总览 Top 10*\n━━━━━━━━━━━━━━━"]
-    for i, coin in enumerate(coins, 1):
-        change = coin.get("price_change_percentage_24h") or 0
-        emoji = "🟢" if change >= 0 else "🔴"
+    lines = [f"📊 *市场 Top {len(coins)}*  `{datetime.utcnow().strftime('%H:%M UTC')}`\n━━━━━━━━━━━━━━━"]
+    for i, c in enumerate(coins, 1):
+        ch24 = c.get("price_change_percentage_24h") or 0
+        e = "🟢" if ch24 >= 0 else "🔴"
         lines.append(
-            f"{i:2}. *{coin['symbol'].upper()}* {emoji} `{change:+.2f}%`\n"
-            f"    `${coin['current_price']:,.4f}` | 市值: `${coin['market_cap']/1e9:.1f}B`"
+            f"`{i:2}.` *{c['symbol'].upper()}* {e}`{ch24:+.2f}%`\n"
+            f"     `${c['current_price']:,.4g}` | 市值`${c['market_cap']/1e9:.1f}B`"
         )
     return "\n".join(lines)
 
 
 def format_trending(data: dict) -> str:
-    """格式化热门趋势"""
     if not data or "coins" not in data:
         return "❌ 无法获取趋势数据"
     lines = ["🔥 *CoinGecko 热搜榜*\n━━━━━━━━━━━━━━━"]
     for i, item in enumerate(data["coins"][:7], 1):
-        coin = item["item"]
-        lines.append(
-            f"{i}. *{coin['name']}* (`{coin['symbol']}`)\n"
-            f"   市值排名: #{coin.get('market_cap_rank', 'N/A')}"
-        )
+        c = item["item"]
+        lines.append(f"`{i}.` *{c['name']}* (`{c['symbol']}`)\n   市值排名 #{c.get('market_cap_rank','N/A')}")
     return "\n".join(lines)
 
 
 def format_fear_greed(data: dict) -> str:
-    """格式化恐惧贪婪指数"""
     if not data or "data" not in data:
         return "❌ 无法获取恐惧贪婪指数"
     d = data["data"][0]
-    value = int(d["value"])
-    classification = d["value_classification"]
-    
-    if value < 25:
-        emoji = "😱"
-    elif value < 45:
-        emoji = "😰"
-    elif value < 55:
-        emoji = "😐"
-    elif value < 75:
-        emoji = "😊"
-    else:
-        emoji = "🤑"
-
-    bar_filled = int(value / 10)
-    bar = "█" * bar_filled + "░" * (10 - bar_filled)
-
+    v = int(d["value"])
+    label = d["value_classification"]
+    emoji = "😱" if v < 25 else "😰" if v < 45 else "😐" if v < 55 else "😊" if v < 75 else "🤑"
+    bar = "█" * (v // 10) + "░" * (10 - v // 10)
     return (
-        f"{emoji} *恐惧贪婪指数*\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"数值: `{value}/100`\n"
-        f"状态: `{classification}`\n"
-        f"进度: `[{bar}]`\n"
-        f"时间: {datetime.now().strftime('%Y-%m-%d')}"
+        f"{emoji} *恐惧贪婪指数*\n━━━━━━━━━━━━━━━\n"
+        f"数值 `{v}/100` | 状态 `{label}`\n"
+        f"`[{bar}]`"
     )
 
 
 def format_news(news_list: list) -> str:
-    """格式化新闻"""
     if not news_list:
         return "❌ 无法获取新闻"
-    lines = ["📰 *最新加密货币资讯*\n━━━━━━━━━━━━━━━"]
-    for news in news_list[:5]:
-        title = news.get("title", "")[:60]
-        source = news.get("source", "")
-        ts = datetime.fromtimestamp(news.get("published_on", 0)).strftime("%m/%d %H:%M")
-        url = news.get("url", "")
-        lines.append(f"• [{title}...]({url})\n  📌 {source} | {ts}")
+    lines = ["📰 *最新加密资讯*\n━━━━━━━━━━━━━━━"]
+    for n in news_list[:5]:
+        title  = (n.get("title") or "")[:60]
+        source = n.get("source", "")
+        ts     = datetime.fromtimestamp(n.get("published_on", 0)).strftime("%m/%d %H:%M")
+        url    = n.get("url", "")
+        lines.append(f"• [{title}...]({url})\n  📌 {source} `{ts}`")
     return "\n\n".join(lines)
 
 
-# ─── Telegram 命令处理 ────────────────────────────────────────────────────────
+# ─── Telegram 命令 ────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """欢迎命令"""
-    keyboard = [
-        [
-            InlineKeyboardButton("💰 市场概览", callback_data="market"),
-            InlineKeyboardButton("🔥 热门趋势", callback_data="trending"),
-        ],
-        [
-            InlineKeyboardButton("😱 恐惧贪婪", callback_data="feargreed"),
-            InlineKeyboardButton("📰 最新资讯", callback_data="news"),
-        ],
-        [
-            InlineKeyboardButton("🐋 巨鲸动向", callback_data="whale"),
-            InlineKeyboardButton("❓ 帮助", callback_data="help"),
-        ],
+    kb = [
+        [InlineKeyboardButton("📊 市场概览", callback_data="market"),
+         InlineKeyboardButton("🔥 热门趋势", callback_data="trending")],
+        [InlineKeyboardButton("😱 恐惧贪婪", callback_data="feargreed"),
+         InlineKeyboardButton("📰 最新资讯", callback_data="news")],
+        [InlineKeyboardButton("🐋 巨鲸动向", callback_data="whale"),
+         InlineKeyboardButton("🌐 全球数据", callback_data="global")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_text(
-        "🤖 *CryptoSage - 加密市场智能助手*\n\n"
-        "我可以帮你：\n"
-        "• 📊 实时查询价格和市场数据\n"
-        "• 🐋 追踪巨鲸大额转账\n"
-        "• 📰 推送最新市场资讯\n"
-        "• 🤖 AI 分析市场行情\n\n"
-        "直接发消息给我，或点击下方按钮：",
+        "🤖 *CryptoSage v2* — 实时加密市场助手\n\n"
+        "直接发消息 → AI 自动注入实时数据分析\n"
+        "或点击按钮快速查询：",
         parse_mode="Markdown",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(kb)
     )
 
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /price bitcoin
-    /price ethereum solana
-    """
     if not context.args:
         await update.message.reply_text(
-            "用法: `/price <币种ID>`\n例如: `/price bitcoin` 或 `/price ethereum solana`",
+            "用法: `/price bitcoin` 或 `/price bitcoin ethereum solana`",
             parse_mode="Markdown"
         )
         return
-
-    coin_ids = " ".join(context.args).lower().replace(",", " ").split()
-    coin_str = ",".join(coin_ids)
-
-    msg = await update.message.reply_text("⏳ 查询中...")
-    data = await get_price(coin_str)
-
+    coin_ids = ",".join([a.lower() for a in context.args])
+    msg = await update.message.reply_text("⏳ 实时查询中...")
+    data = await get_price(coin_ids)
     if not data:
-        await msg.edit_text("❌ 获取价格失败，请检查币种名称是否正确（使用 CoinGecko ID）")
+        await msg.edit_text("❌ 查询失败，请检查币种 ID")
         return
-
-    results = []
-    for coin_id in coin_ids:
-        results.append(format_price_message(coin_id, data))
-
-    keyboard = [[InlineKeyboardButton("🔄 刷新", callback_data=f"refresh_price_{coin_str}")]]
-    await msg.edit_text(
-        "\n\n".join(results),
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    results = [format_price_message(c, data) for c in coin_ids.split(",")]
+    kb = [[InlineKeyboardButton("🔄 刷新", callback_data=f"rprice_{coin_ids}")]]
+    await msg.edit_text("\n\n".join(results), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """市场概览"""
-    msg = await update.message.reply_text("⏳ 加载市场数据...")
+    msg = await update.message.reply_text("⏳ 加载中...")
     coins = await get_market_overview(10)
     if not coins:
         await msg.edit_text("❌ 无法获取市场数据")
         return
-    await msg.edit_text(format_market_overview(coins), parse_mode="Markdown")
+    kb = [[InlineKeyboardButton("🔄 刷新", callback_data="market")]]
+    await msg.edit_text(format_market_overview(coins), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /whale         → 查看巨鲸动向
-    /whale 5000000 → 最低 500万 USD 的转账
-    """
-    min_val = 1_000_000
-    if context.args:
-        try:
-            min_val = int(context.args[0])
-        except ValueError:
-            pass
+    min_val = int(context.args[0]) if context.args else 1_000_000
+    msg = await update.message.reply_text("🐋 查询中...")
+    data = await get_whale_transactions(min_val)
 
-    msg = await update.message.reply_text("🐋 查询巨鲸动向...")
-    whale_data = await get_whale_transactions(min_val)
-
-    if not whale_data:
-        await msg.edit_text("❌ 无法获取巨鲸数据")
-        return
-
-    if whale_data.get("status") == "no_key":
-        # 无 Whale Alert API Key，用 AI + 交易所流量数据分析
-        btc_flows = await get_exchange_flows("bitcoin")
-        eth_flows = await get_exchange_flows("ethereum")
-        
-        context_str = ""
-        if btc_flows and "volumes" in btc_flows:
-            context_str += f"BTC 近24h链上成交量数据点数: {len(btc_flows.get('total_volumes', []))}\n"
-        
-        ai_analysis = await chat_with_deepseek(
+    if not data or data.get("status") == "no_key":
+        ai = await chat_with_deepseek(
             update.effective_user.id,
-            "请基于当前市场状况，分析可能的巨鲸行为模式和资金流向趋势，并给出注意事项。",
-            context_str
+            "请分析当前加密货币市场巨鲸资金动向特征，并给出链上信号解读。"
         )
         await msg.edit_text(
-            "🐋 *巨鲸动向分析*\n━━━━━━━━━━━━━━━\n"
-            "⚠️ 未配置 Whale Alert API，以下为 AI 分析：\n\n"
-            f"{ai_analysis}\n\n"
-            "💡 提示: 在 `.env` 中配置 `WHALE_ALERT_API_KEY` 获取实时巨鲸数据\n"
-            "注册地址: https://whale-alert.io",
+            f"🐋 *巨鲸动向 AI 分析*\n━━━━━━━━━━━━━━━\n{ai}\n\n"
+            "💡 配置 `WHALE_ALERT_API_KEY` 可获取实时巨鲸转账数据",
             parse_mode="Markdown"
         )
         return
 
-    transactions = whale_data.get("transactions", [])
-    if not transactions:
-        await msg.edit_text("⚠️ 最近没有符合条件的巨鲸转账记录")
+    txs = data.get("transactions", [])
+    if not txs:
+        await msg.edit_text("⚠️ 最近无符合条件的大额转账")
         return
 
-    lines = [f"🐋 *巨鲸动向 (最低 ${min_val:,})*\n━━━━━━━━━━━━━━━"]
-    for tx in transactions[:8]:
-        amount = tx.get("amount", 0)
-        symbol = tx.get("symbol", "").upper()
-        amount_usd = tx.get("amount_usd", 0)
-        from_owner = tx.get("from", {}).get("owner", "未知地址")
-        to_owner = tx.get("to", {}).get("owner", "未知地址")
-        tx_type = "➡️" if "unknown" not in from_owner.lower() else "📤"
-        
-        lines.append(
-            f"{tx_type} `{amount:,.0f} {symbol}` (≈`${amount_usd:,.0f}`)\n"
-            f"   {from_owner} → {to_owner}"
-        )
+    lines = [f"🐋 *巨鲸动向 (>=${min_val:,})*\n━━━━━━━━━━━━━━━"]
+    for tx in txs[:8]:
+        amt   = tx.get("amount", 0)
+        sym   = tx.get("symbol", "").upper()
+        usd   = tx.get("amount_usd", 0)
+        frm   = tx.get("from", {}).get("owner", "匿名")
+        to    = tx.get("to",   {}).get("owner", "匿名")
+        lines.append(f"💸 `{amt:,.0f} {sym}` ≈ `${usd:,.0f}`\n   {frm} ➜ {to}")
 
     await msg.edit_text("\n\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """最新资讯"""
-    msg = await update.message.reply_text("📰 获取最新资讯...")
+    msg = await update.message.reply_text("📰 获取资讯...")
     news = await get_crypto_news(5)
     await msg.edit_text(format_news(news), parse_mode="Markdown", disable_web_page_preview=True)
 
 
 async def cmd_fear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """恐惧贪婪指数"""
     msg = await update.message.reply_text("⏳ 查询中...")
     data = await get_fear_greed()
     await msg.edit_text(format_fear_greed(data), parse_mode="Markdown")
 
 
 async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """热门趋势"""
     msg = await update.message.reply_text("🔥 获取热搜榜...")
     data = await get_trending()
     await msg.edit_text(format_trending(data), parse_mode="Markdown")
 
 
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """清除对话历史"""
-    user_id = update.effective_user.id
-    user_conversations[user_id] = []
-    await update.message.reply_text("✅ 对话历史已清除")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """帮助信息"""
-    await update.message.reply_text(
-        "📖 *命令列表*\n━━━━━━━━━━━━━━━\n"
-        "`/start` - 主菜单\n"
-        "`/price <ID>` - 查询价格 (支持多个)\n"
-        "  例: `/price bitcoin ethereum solana`\n\n"
-        "`/market` - 市场 Top 10 概览\n"
-        "`/whale [最低金额]` - 巨鲸动向\n"
-        "  例: `/whale 5000000`\n\n"
-        "`/news` - 最新资讯\n"
-        "`/fear` - 恐惧贪婪指数\n"
-        "`/trending` - 热门趋势\n"
-        "`/clear` - 清除 AI 对话历史\n\n"
-        "💬 *直接发消息* - 与 AI 对话，自动获取市场数据辅助分析\n\n"
-        "📌 币种 ID 参考 CoinGecko: https://coingecko.com",
+async def cmd_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🌐 获取全球数据...")
+    data = await get_global_stats()
+    if not data or "data" not in data:
+        await msg.edit_text("❌ 无法获取全球数据")
+        return
+    d = data["data"]
+    mktcap = d.get("total_market_cap", {}).get("usd", 0)
+    vol    = d.get("total_volume", {}).get("usd", 0)
+    btc_d  = d.get("market_cap_percentage", {}).get("btc", 0)
+    eth_d  = d.get("market_cap_percentage", {}).get("eth", 0)
+    await msg.edit_text(
+        f"🌐 *全球市场数据*\n━━━━━━━━━━━━━━━\n"
+        f"💰 总市值: `${mktcap/1e12:.2f}T`\n"
+        f"📊 24h 成交量: `${vol/1e9:.1f}B`\n"
+        f"₿ BTC 占比: `{btc_d:.1f}%`\n"
+        f"Ξ ETH 占比: `{eth_d:.1f}%`\n"
+        f"🕐 `{datetime.utcnow().strftime('%H:%M:%S UTC')}`",
         parse_mode="Markdown"
     )
 
 
-# ─── 自然语言消息处理 (AI 对话) ───────────────────────────────────────────────
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_conversations.pop(update.effective_user.id, None)
+    await update.message.reply_text("✅ 对话历史已清除")
 
-PRICE_KEYWORDS = ["价格", "多少钱", "price", "怎么样", "行情", "最新", "现在"]
-WHALE_KEYWORDS = ["巨鲸", "whale", "大户", "转账", "资金流"]
-MARKET_KEYWORDS = ["市场", "大盘", "market", "趋势", "overview"]
-NEWS_KEYWORDS = ["新闻", "资讯", "news", "最新消息"]
 
-# 常见币种别名映射 → CoinGecko ID
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *命令列表*\n━━━━━━━━━━━━━━━\n"
+        "`/price <ID...>` 实时价格\n"
+        "`/market` Top10 市场\n"
+        "`/whale [最低金额]` 巨鲸动向\n"
+        "`/news` 最新资讯\n"
+        "`/fear` 恐惧贪婪指数\n"
+        "`/trending` 热搜榜\n"
+        "`/global` 全球市场数据\n"
+        "`/clear` 清除 AI 对话历史\n\n"
+        "💬 直接发消息 → AI + 实时数据\n"
+        "🔗 币种ID查询: coingecko.com",
+        parse_mode="Markdown"
+    )
+
+
+# ─── AI 消息处理 ──────────────────────────────────────────────────────────────
+
 COIN_ALIAS = {
-    "btc": "bitcoin", "比特币": "bitcoin",
-    "eth": "ethereum", "以太坊": "ethereum", "以太": "ethereum",
-    "sol": "solana", "索拉纳": "solana",
-    "bnb": "binancecoin",
-    "xrp": "ripple", "瑞波币": "ripple",
-    "ada": "cardano",
-    "doge": "dogecoin", "狗狗币": "dogecoin",
-    "ton": "the-open-network",
-    "dot": "polkadot", "波卡": "polkadot",
-    "avax": "avalanche-2", "雪崩": "avalanche-2",
-    "link": "chainlink",
-    "uni": "uniswap",
-    "ltc": "litecoin", "莱特币": "litecoin",
-    "shib": "shiba-inu",
-    "sui": "sui",
-    "trx": "tron", "波场": "tron",
+    "btc":"bitcoin","比特币":"bitcoin",
+    "eth":"ethereum","以太坊":"ethereum","以太":"ethereum",
+    "sol":"solana","索拉纳":"solana",
+    "bnb":"binancecoin",
+    "xrp":"ripple","瑞波":"ripple",
+    "ada":"cardano",
+    "doge":"dogecoin","狗狗币":"dogecoin",
+    "ton":"the-open-network",
+    "dot":"polkadot","波卡":"polkadot",
+    "avax":"avalanche-2",
+    "link":"chainlink",
+    "uni":"uniswap",
+    "ltc":"litecoin","莱特币":"litecoin",
+    "shib":"shiba-inu",
+    "sui":"sui",
+    "trx":"tron","波场":"tron",
+    "pepe":"pepe",
+    "apt":"aptos",
+    "arb":"arbitrum",
+    "op":"optimism",
 }
 
+PRICE_KW  = ["价格","多少","price","行情","最新","现在","涨","跌","点位"]
+MARKET_KW = ["市场","大盘","market","趋势","概况"]
+FEAR_KW   = ["恐惧","贪婪","情绪","fear","greed","指数"]
 
-def detect_coins_in_message(text: str) -> list[str]:
-    """从消息中识别提到的币种"""
-    text_lower = text.lower()
-    found = []
-    for alias, coin_id in COIN_ALIAS.items():
-        if alias in text_lower and coin_id not in found:
-            found.append(coin_id)
-    return found[:3]  # 最多3个
+
+def detect_coins(text: str) -> list[str]:
+    t = text.lower()
+    return list(dict.fromkeys(v for k, v in COIN_ALIAS.items() if k in t))[:4]
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理普通消息 - AI 对话 + 自动注入市场数据"""
     user_id = update.effective_user.id
-    text = update.message.text
-
-    # 发送 typing 状态
+    text = update.message.text or ""
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    # 自动检测消息中提到的币种，注入实时数据
-    context_parts = []
-    
-    # 检测币种并获取价格
-    coins = detect_coins_in_message(text)
-    if coins or any(kw in text for kw in PRICE_KEYWORDS):
-        if not coins:
-            coins = ["bitcoin", "ethereum"]  # 默认查询主流币
-        price_data = await get_price(",".join(coins))
+    ctx_parts = []
+
+    # 检测币种 → 并发获取价格
+    coins = detect_coins(text)
+    if coins or any(k in text for k in PRICE_KW):
+        targets = coins or ["bitcoin", "ethereum"]
+        price_data = await get_price(",".join(targets))
         if price_data:
-            price_str = json.dumps(price_data, ensure_ascii=False)
-            context_parts.append(f"实时价格数据: {price_str}")
+            ctx_parts.append("实时价格: " + json.dumps(price_data, ensure_ascii=False))
 
-    # 检测是否需要市场数据
-    if any(kw in text for kw in MARKET_KEYWORDS):
-        market_data = await get_market_overview(5)
-        if market_data:
-            summary = [f"{c['symbol'].upper()}: ${c['current_price']:,.2f} ({c['price_change_percentage_24h']:+.2f}%)" 
-                      for c in market_data]
-            context_parts.append("市场Top5: " + " | ".join(summary))
+    # 市场数据
+    if any(k in text for k in MARKET_KW):
+        md = await get_market_overview(5)
+        if md:
+            ctx_parts.append("Top5市场: " + " | ".join(
+                f"{c['symbol'].upper()} ${c['current_price']:,.2f}({c['price_change_percentage_24h']:+.2f}%)"
+                for c in md
+            ))
 
-    # 检测是否需要恐惧贪婪指数
-    if any(kw in text for kw in ["恐惧", "贪婪", "情绪", "fear", "greed"]):
+    # 恐惧贪婪
+    if any(k in text for k in FEAR_KW):
         fg = await get_fear_greed()
         if fg and "data" in fg:
             d = fg["data"][0]
-            context_parts.append(f"恐惧贪婪指数: {d['value']}/100 ({d['value_classification']})")
+            ctx_parts.append(f"恐惧贪婪: {d['value']}/100 ({d['value_classification']})")
 
-    context_data = "\n".join(context_parts)
-    
-    # 调用 DeepSeek AI
-    response = await chat_with_deepseek(user_id, text, context_data)
-    
+    response = await chat_with_deepseek(user_id, text, "\n".join(ctx_parts))
     await update.message.reply_text(response, parse_mode="Markdown")
 
 
-# ─── 按钮回调处理 ─────────────────────────────────────────────────────────────
+# ─── 按钮回调 ─────────────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理内联键盘按钮点击"""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+    q = update.callback_query
+    await q.answer()
+    d = q.data
 
-    if data == "market":
+    if d == "market":
         coins = await get_market_overview(10)
         if coins:
-            await query.edit_message_text(format_market_overview(coins), parse_mode="Markdown")
-    
-    elif data == "trending":
-        trend = await get_trending()
-        await query.edit_message_text(format_trending(trend), parse_mode="Markdown")
-    
-    elif data == "feargreed":
-        fg = await get_fear_greed()
-        await query.edit_message_text(format_fear_greed(fg), parse_mode="Markdown")
-    
-    elif data == "news":
-        news = await get_crypto_news(5)
-        await query.edit_message_text(
-            format_news(news), parse_mode="Markdown", disable_web_page_preview=True
-        )
-    
-    elif data == "whale":
-        whale_data = await get_whale_transactions()
-        if not WHALE_ALERT_KEY:
-            ai_text = await chat_with_deepseek(
-                query.from_user.id,
-                "请分析当前加密货币市场的巨鲸资金动向和链上数据特征。"
-            )
-            await query.edit_message_text(
-                f"🐋 *巨鲸动向 AI 分析*\n━━━━━━━━━━━━━━━\n{ai_text}",
+            kb = [[InlineKeyboardButton("🔄 刷新", callback_data="market")]]
+            await q.edit_message_text(format_market_overview(coins), parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(kb))
+    elif d == "trending":
+        await q.edit_message_text(format_trending(await get_trending()), parse_mode="Markdown")
+    elif d == "feargreed":
+        await q.edit_message_text(format_fear_greed(await get_fear_greed()), parse_mode="Markdown")
+    elif d == "news":
+        await q.edit_message_text(format_news(await get_crypto_news(5)),
+                                  parse_mode="Markdown", disable_web_page_preview=True)
+    elif d == "global":
+        data = await get_global_stats()
+        if data and "data" in data:
+            dd = data["data"]
+            mktcap = dd.get("total_market_cap", {}).get("usd", 0)
+            vol    = dd.get("total_volume", {}).get("usd", 0)
+            btc_d  = dd.get("market_cap_percentage", {}).get("btc", 0)
+            await q.edit_message_text(
+                f"🌐 *全球市场*\n💰 总市值 `${mktcap/1e12:.2f}T`\n"
+                f"📊 24h量 `${vol/1e9:.1f}B`\n₿ BTC占比 `{btc_d:.1f}%`",
                 parse_mode="Markdown"
             )
-        else:
-            await query.edit_message_text(format_trending({}), parse_mode="Markdown")
-    
-    elif data == "help":
-        await query.edit_message_text(
-            "📖 直接发消息与 AI 对话，或使用命令:\n"
-            "/price /market /whale /news /fear /trending",
-            parse_mode="Markdown"
-        )
-    
-    elif data.startswith("refresh_price_"):
-        coin_str = data.replace("refresh_price_", "")
-        price_data = await get_price(coin_str)
-        if price_data:
-            results = [format_price_message(cid, price_data) for cid in coin_str.split(",")]
-            keyboard = [[InlineKeyboardButton("🔄 刷新", callback_data=f"refresh_price_{coin_str}")]]
-            await query.edit_message_text(
-                "\n\n".join(results),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+    elif d == "whale":
+        data = await get_whale_transactions()
+        if not WHALE_ALERT_KEY or data.get("status") == "no_key":
+            ai = await chat_with_deepseek(q.from_user.id, "分析当前加密市场巨鲸资金动向。")
+            await q.edit_message_text(f"🐋 *AI巨鲸分析*\n━━━━━━━━━━━━━━━\n{ai}", parse_mode="Markdown")
+    elif d.startswith("rprice_"):
+        coin_ids = d[7:]
+        data = await get_price(coin_ids)
+        if data:
+            results = [format_price_message(c, data) for c in coin_ids.split(",")]
+            kb = [[InlineKeyboardButton("🔄 刷新", callback_data=f"rprice_{coin_ids}")]]
+            await q.edit_message_text("\n\n".join(results), parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(kb))
 
 
-# ─── 定时任务 ─────────────────────────────────────────────────────────────────
+# ─── HTTP 服务（Render 必须监听端口）+ 自 ping 防休眠 ─────────────────────────
 
-async def scheduled_market_update(context: ContextTypes.DEFAULT_TYPE):
+async def health_handler(request):
+    return web.Response(text="OK", status=200)
+
+
+async def webhook_handler(request, application):
+    """接收 Telegram Webhook 请求"""
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+    return web.Response(status=200)
+
+
+async def self_ping_task():
     """
-    定时推送市场更新 (需要配置 ALERT_CHAT_ID)
-    可在 main() 中启用
+    每 10 分钟 ping 自身健康接口，防止 Render 免费版休眠。
+    Render 免费版 15 分钟无请求就会休眠，所以间隔要 < 14 分钟。
     """
-    chat_id = os.getenv("ALERT_CHAT_ID")
-    if not chat_id:
+    if not RENDER_URL:
+        logger.info("RENDER_EXTERNAL_URL 未设置，跳过自 ping")
         return
-
-    coins = await get_market_overview(5)
-    fg = await get_fear_greed()
-    
-    if coins:
-        msg = format_market_overview(coins)
-        if fg:
-            msg += "\n\n" + format_fear_greed(fg)
-        await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
+    url = f"{RENDER_URL}/health"
+    logger.info(f"自 ping 启动，目标: {url}")
+    while True:
+        await asyncio.sleep(600)  # 10 分钟
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    logger.info(f"Self-ping: {r.status}")
+        except Exception as e:
+            logger.warning(f"Self-ping failed: {e}")
 
 
 # ─── 主程序 ───────────────────────────────────────────────────────────────────
 
-def main():
-    print("🚀 CryptoSage Bot 启动中...")
-    
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+async def main():
+    if not TELEGRAM_TOKEN:
+        raise ValueError("❌ TELEGRAM_BOT_TOKEN 未设置")
+    if not DEEPSEEK_API_KEY:
+        raise ValueError("❌ DEEPSEEK_API_KEY 未设置")
+
+    print("🚀 CryptoSage v3 启动（三层实时价格）...")
+
+    # 构建 Application（不启动 polling）
+    application = Application.builder().token(TELEGRAM_TOKEN).updater(None).build()
 
     # 注册命令
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("market", cmd_market))
-    app.add_handler(CommandHandler("whale", cmd_whale))
-    app.add_handler(CommandHandler("news", cmd_news))
-    app.add_handler(CommandHandler("fear", cmd_fear))
-    app.add_handler(CommandHandler("trending", cmd_trending))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    
-    # 注册按钮回调
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # 注册普通消息处理 (AI 对话)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    for cmd, fn in [
+        ("start",    cmd_start),
+        ("help",     cmd_help),
+        ("price",    cmd_price),
+        ("market",   cmd_market),
+        ("whale",    cmd_whale),
+        ("news",     cmd_news),
+        ("fear",     cmd_fear),
+        ("trending", cmd_trending),
+        ("global",   cmd_global),
+        ("clear",    cmd_clear),
+    ]:
+        application.add_handler(CommandHandler(cmd, fn))
 
-    # 可选: 定时推送 (每小时)
-    # alert_chat_id = os.getenv("ALERT_CHAT_ID")
-    # if alert_chat_id:
-    #     app.job_queue.run_repeating(scheduled_market_update, interval=3600, first=10)
-    #     print(f"✅ 定时推送已启用，目标群组: {alert_chat_id}")
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("✅ Bot 已就绪，按 Ctrl+C 停止")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.initialize()
+    await application.start()
+
+    # 设置 Webhook
+    if RENDER_URL:
+        webhook_url = f"{RENDER_URL}/webhook/{TELEGRAM_TOKEN}"
+        await application.bot.set_webhook(
+            url=webhook_url,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True      # 丢弃积压消息，避免收到旧数据
+        )
+        logger.info(f"✅ Webhook 已设置: {webhook_url}")
+    else:
+        logger.warning("⚠️ RENDER_EXTERNAL_URL 未设置，Webhook 未注册（本地测试模式）")
+
+    # 构建 aiohttp Web 服务
+    app_web = web.Application()
+    app_web.router.add_get("/health", health_handler)
+    app_web.router.add_post(
+        f"/webhook/{TELEGRAM_TOKEN}",
+        lambda req: webhook_handler(req, application)
+    )
+
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"✅ HTTP 服务已启动，端口 {PORT}")
+
+    # 启动自 ping 防休眠
+    asyncio.create_task(self_ping_task())
+
+    logger.info("🎯 Bot 运行中（Webhook 模式）...")
+    # 保持运行
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await application.stop()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
